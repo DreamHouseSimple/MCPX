@@ -22,11 +22,23 @@ from ddgs import DDGS
 # =====================================================================
 # CONFIGURATION: Reads your endpoint securely from Environment Secrets
 # =====================================================================
-MCP_BRIDGE_ENDPOINT = os.environ.get("MCP_BRIDGE_ENDPOINT")
-# Fixed source URL for the 'daily_info' tool (a page that publishes fresh
-# daily content - facts/news/discounts/etc.). Set this as a secret once you
-# have the real URL; the tool returns a clear error if unset.
-DAILY_INFO_URL = os.environ.get("DAILY_INFO_URL")
+# Supports one or more bridge endpoints. Provide a single URL, or multiple
+# URLs separated by commas/semicolons/newlines (e.g.
+# "wss://host-a/ws, wss://host-b/ws, wss://host-c/ws") to maintain several
+# simultaneous, independently-reconnecting MCP bridge connections.
+def _parse_endpoints(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    parts = re.split(r"[,;\n]+", raw)
+    return [p.strip() for p in parts if p.strip()]
+
+
+MCP_BRIDGE_ENDPOINTS = _parse_endpoints(os.environ.get("MCP_BRIDGE_ENDPOINT"))
+# Fixed source URL for the 'special_info' tool - a specific, pre-configured
+# page/source set up by the operator (could be internal docs, a private feed,
+# a particular news/discount page, etc.). Set this as a secret once you have
+# the real URL; the tool returns a clear error if unset.
+SPECIAL_INFO_URL = os.environ.get("SPECIAL_INFO_URL")
 
 # Setup clean logging output
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -212,61 +224,6 @@ def _domain_trust_tier(url: str) -> tuple[str, float]:
     return "standard", 0.6
 
 
-# ---- Query expansion: rule-based reformulations, no LLM/network needed ----
-CONCEPT_MAP = {
-    "ai": ["artificial intelligence", "machine learning"],
-    "ml": ["machine learning", "statistical learning"],
-    "llm": ["large language model", "foundation model"],
-    "api": ["interface", "sdk", "integration"],
-    "price": ["cost", "pricing"],
-    "best": ["top", "recommended"],
-    "vs": ["versus", "comparison"],
-    "news": ["latest updates", "recent developments"],
-    "guide": ["tutorial", "how to"],
-}
-OPPOSITION_TRIGGERS = {
-    "best": "worst problems with",
-    "benefits": "risks drawbacks of",
-    "pros": "cons drawbacks",
-    "safe": "risks dangers of",
-    "easy": "challenges difficulties of",
-}
-QUESTION_PREFIXES = ("what is", "how does", "why is", "how to")
-
-
-def generate_query_variations(query: str, limit: int = 3) -> list[str]:
-    """Generate up to `limit` genuinely different reformulations of `query`,
-    since a single literal phrasing not matching page wording is the most
-    common cause of empty/irrelevant search results. Ported from
-    agent-search's rule-based query_expansion module (no LLM call, no
-    network access)."""
-    variations: list[str] = []
-    lower = query.strip().lower()
-    words = lower.split()
-
-    for word, concepts in CONCEPT_MAP.items():
-        if re.search(rf"\b{re.escape(word)}\b", lower):
-            for concept in concepts:
-                candidate = re.sub(rf"\b{re.escape(word)}\b", concept, lower, count=1)
-                if candidate != lower:
-                    variations.append(candidate)
-
-    for trigger, opposite in OPPOSITION_TRIGGERS.items():
-        if trigger in words:
-            variations.append(f"{lower} {opposite}")
-
-    if not lower.startswith(QUESTION_PREFIXES) and len(words) <= 6:
-        variations.append(f"what is {lower}")
-
-    seen: set[str] = set()
-    out: list[str] = []
-    for v in variations:
-        if v not in seen and v != lower:
-            seen.add(v)
-            out.append(v)
-    return out[:limit]
-
-
 # ---- Dedup + authority scoring across merged search hits ----
 DOMAIN_AUTHORITY = {
     "wikipedia.org": 0.3, "github.com": 0.25, "stackoverflow.com": 0.25,
@@ -298,11 +255,16 @@ def _normalize_for_dedup(url: str) -> str:
 
 
 def merge_and_rank_hits(hits_per_query: list[tuple[str, list[dict]]]) -> list[dict]:
-    """Dedup search hits gathered across one or more query variations, and
-    rank them by (how many variations surfaced it) + domain authority +
-    domain trust, so low-quality/duplicate links stop burning source slots."""
+    """Dedup search hits gathered across one or more queries, and rank them
+    by (how many queries surfaced it) + domain authority + domain trust, so
+    low-quality/duplicate links stop burning source slots.
+
+    hits_per_query[0] is always the caller's primary/main query - entries
+    found by it get an explicit score boost so any additional queries
+    (supplied by the caller for broader coverage) can't outrank/drown out
+    the results that matched the primary query."""
     merged: dict[str, dict] = {}
-    for _query, hits in hits_per_query:
+    for query_index, (_query, hits) in enumerate(hits_per_query):
         for rank, res in enumerate(hits):
             url = res.get("href") or res.get("url")
             if not url or not _is_safe_url(url):
@@ -319,15 +281,19 @@ def merge_and_rank_hits(hits_per_query: list[tuple[str, list[dict]]]) -> list[di
                     "best_rank": rank,
                     "trust_tier": tier,
                     "trust_score": trust_score,
+                    "from_primary_query": False,
                 }
                 merged[key] = entry
             entry["hits"] += 1
             entry["best_rank"] = min(entry["best_rank"], rank)
+            if query_index == 0:
+                entry["from_primary_query"] = True
 
     def _score(e: dict) -> float:
         host = (urlparse(e["url"]).hostname or "").removeprefix("www.")
         authority = DOMAIN_AUTHORITY.get(host, 0.0)
-        return (e["hits"] * 2.0) + authority + e["trust_score"] - (e["best_rank"] * 0.05)
+        primary_bonus = 3.0 if e["from_primary_query"] else 0.0
+        return (e["hits"] * 2.0) + authority + e["trust_score"] + primary_bonus - (e["best_rank"] * 0.05)
 
     return sorted(merged.values(), key=_score, reverse=True)
 
@@ -367,6 +333,39 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
     "Googlebot/2.1 (+http://www.google.com/bot.html)",
 ]
+# Extra headers that accompany each User-Agent above, mimicking what a real
+# browser actually sends on a top-level navigation (many simple bot filters
+# check for these alongside the UA string). Googlebot deliberately gets none
+# of these - real crawlers don't send sec-ch-ua/sec-fetch-* client hints, so
+# adding them there would be a giveaway rather than camouflage.
+BROWSER_EXTRA_HEADERS = [
+    {
+        "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    },
+    {
+        "sec-ch-ua-platform": '"macOS"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    },
+    {
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    },
+    {},  # Googlebot: no browser-only client hints
+]
 CONTENT_SELECTORS = [
     "main", "article", "[role=main]", ".content", "#content",
     ".post-content", ".entry-content", ".article-body", ".post-body",
@@ -403,8 +402,20 @@ def _is_paywalled(text: str) -> bool:
     return any(sig in lower for sig in PAYWALL_SIGNALS)
 
 
+# Raw HTML is capped before handing it to BeautifulSoup. Even though parsing
+# now runs in a worker thread (see below), an unbounded parse of a multi-MB
+# page can still tie up that thread for a long time; capping keeps worst-case
+# parse time predictable and bounds memory use for abnormally large/malicious
+# pages.
+MAX_RAW_HTML_CHARS = 2_000_000
+
+
 def _clean_html(html_text: str) -> str | None:
-    soup = BeautifulSoup(html_text, "html.parser")
+    """CPU-bound HTML parsing. Always call this via asyncio.to_thread from
+    async code - BeautifulSoup's html.parser is pure Python and can run long
+    enough on large pages to starve the event loop, which stalls the
+    websocket's ping/pong keepalive and causes spurious disconnects."""
+    soup = BeautifulSoup(html_text[:MAX_RAW_HTML_CHARS], "html.parser")
     for tag in soup(GARBAGE_TAGS):
         tag.decompose()
     for selector in GARBAGE_CLASSES:
@@ -421,10 +432,12 @@ def _clean_html(html_text: str) -> str | None:
 
 
 async def _strategy_direct(client: httpx.AsyncClient, url: str, ua_index: int = 0, referer: str | None = None) -> str | None:
+    index = ua_index % len(USER_AGENTS)
     headers = {
-        "User-Agent": USER_AGENTS[ua_index % len(USER_AGENTS)],
+        "User-Agent": USER_AGENTS[index],
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        **BROWSER_EXTRA_HEADERS[index],
     }
     if referer:
         headers["Referer"] = referer
@@ -434,13 +447,36 @@ async def _strategy_direct(client: httpx.AsyncClient, url: str, ua_index: int = 
             return None
         if "pdf" in r.headers.get("content-type", "").lower():
             return None
-        text = _clean_html(r.text)
+        text = await asyncio.to_thread(_clean_html, r.text)
         if text and not _is_paywalled(text):
             return text
         return None
     except Exception as exc:
         logger.debug(f"Direct fetch failed for {_hostname(url)}: {exc}")
         return None
+
+
+def _readability_extract(html_text: str) -> str | None:
+    """CPU-bound readability scoring. Always call via asyncio.to_thread (see
+    _clean_html's docstring for why)."""
+    soup = BeautifulSoup(html_text[:MAX_RAW_HTML_CHARS], "html.parser")
+    for tag in soup(GARBAGE_TAGS):
+        tag.decompose()
+    candidates = []
+    for tag in soup.find_all(["div", "article", "section", "main"]):
+        text = tag.get_text(strip=True)
+        if len(text) < MIN_USEFUL_CHARS:
+            continue
+        p_count = len(tag.find_all("p"))
+        link_density = len(tag.find_all("a")) / max(p_count, 1)
+        score = len(text) + (p_count * 100) - (link_density * 200)
+        candidates.append((score, text))
+    if candidates:
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        text = candidates[0][1]
+        if not _is_paywalled(text):
+            return text[:MAX_CONTENT_CHARS]
+    return None
 
 
 async def _strategy_readability(client: httpx.AsyncClient, url: str) -> str | None:
@@ -450,24 +486,7 @@ async def _strategy_readability(client: httpx.AsyncClient, url: str) -> str | No
         r = await _safe_get(client, url, timeout=FETCH_TIMEOUT, headers={"User-Agent": USER_AGENTS[0]})
         if not r.is_success:
             return None
-        soup = BeautifulSoup(r.text, "html.parser")
-        for tag in soup(GARBAGE_TAGS):
-            tag.decompose()
-        candidates = []
-        for tag in soup.find_all(["div", "article", "section", "main"]):
-            text = tag.get_text(strip=True)
-            if len(text) < MIN_USEFUL_CHARS:
-                continue
-            p_count = len(tag.find_all("p"))
-            link_density = len(tag.find_all("a")) / max(p_count, 1)
-            score = len(text) + (p_count * 100) - (link_density * 200)
-            candidates.append((score, text))
-        if candidates:
-            candidates.sort(key=lambda c: c[0], reverse=True)
-            text = candidates[0][1]
-            if not _is_paywalled(text):
-                return text[:MAX_CONTENT_CHARS]
-        return None
+        return await asyncio.to_thread(_readability_extract, r.text)
     except Exception as exc:
         logger.debug(f"Readability fetch failed for {_hostname(url)}: {exc}")
         return None
@@ -488,7 +507,7 @@ async def _strategy_wayback(client: httpx.AsyncClient, url: str) -> str | None:
                 snapshot_url = f"https://web.archive.org/web/{timestamp}/{url}"
                 r2 = await _safe_get(client, snapshot_url, timeout=WAYBACK_TIMEOUT, headers={"User-Agent": USER_AGENTS[0]})
                 if r2.is_success:
-                    text = _clean_html(r2.text)
+                    text = await asyncio.to_thread(_clean_html, r2.text)
                     if text:
                         return text
         return None
@@ -505,11 +524,76 @@ async def _strategy_medium_bypass(client: httpx.AsyncClient, url: str) -> str | 
         freedium_url = f"https://freedium.cfd/{url}"
         r = await _safe_get(client, freedium_url, timeout=FETCH_TIMEOUT, headers={"User-Agent": USER_AGENTS[0]})
         if r.is_success:
-            return _clean_html(r.text)
+            return await asyncio.to_thread(_clean_html, r.text)
         return None
     except Exception as exc:
         logger.debug(f"Medium bypass failed for {_hostname(url)}: {exc}")
         return None
+
+
+# ---- Last-resort headless browser fallback (Playwright) ----
+# Only used when every lightweight HTTP-based strategy above has failed.
+# Real bot-protection (Cloudflare/Akamai-style JS challenges, TLS/header
+# fingerprinting) generally can't be defeated with plain HTTP requests no
+# matter how browser-like the headers look - it needs an actual browser
+# engine executing JavaScript. This is deliberately gated as a last resort
+# since launching/driving Chromium is far heavier (memory, CPU, latency)
+# than the HTTP-based strategies.
+HEADLESS_NAV_TIMEOUT = 20_000  # milliseconds
+HEADLESS_SETTLE_DELAY = 2.5    # seconds to let JS challenges/redirects resolve
+_headless_browser = None
+_headless_browser_lock = asyncio.Lock()
+# Bounds how many headless pages can be open at once, since each Chromium
+# tab costs real memory/CPU - keep this low on constrained hosts (e.g. free
+# hosting tiers) to avoid the process getting OOM-killed.
+_headless_semaphore = asyncio.Semaphore(1)
+
+
+async def _get_headless_browser():
+    global _headless_browser
+    if _headless_browser is None:
+        async with _headless_browser_lock:
+            if _headless_browser is None:
+                from playwright.async_api import async_playwright
+                playwright_ctx = await async_playwright().start()
+                _headless_browser = await playwright_ctx.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+                )
+    return _headless_browser
+
+
+async def _strategy_headless_browser(url: str) -> str | None:
+    try:
+        browser = await _get_headless_browser()
+    except Exception as exc:
+        logger.debug(f"Headless browser unavailable (is Playwright/Chromium installed?): {exc}")
+        return None
+
+    async with _headless_semaphore:
+        context = None
+        try:
+            context = await browser.new_context(
+                user_agent=USER_AGENTS[0],
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+            )
+            page = await context.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=HEADLESS_NAV_TIMEOUT)
+            # Give Cloudflare/Akamai-style JS challenges a moment to resolve
+            # and redirect to the real page before we read the DOM.
+            await asyncio.sleep(HEADLESS_SETTLE_DELAY)
+            html_text = await page.content()
+            text = await asyncio.to_thread(_clean_html, html_text)
+            if text and not _is_paywalled(text):
+                return text
+            return None
+        except Exception as exc:
+            logger.debug(f"Headless browser fetch failed for {_hostname(url)}: {exc}")
+            return None
+        finally:
+            if context is not None:
+                await context.close()
 
 
 @dataclass
@@ -520,11 +604,15 @@ class ExtractResult:
     trust_tier: str
 
 
-async def extract_content(client: httpx.AsyncClient, url: str) -> ExtractResult:
+async def extract_content(client: httpx.AsyncClient, url: str, *, allow_headless: bool = True) -> ExtractResult:
     """Escalating content extraction: tries several strategies (cheap/fast
     first) until one returns usable content, instead of giving up after one
     attempt. Adapted from agent-search's kill_chain(), trimmed to the
-    strategies that don't need a browser engine, SearXNG, or WHOIS."""
+    strategies that don't need SearXNG or WHOIS. A headless-browser pass is
+    included as the final, most expensive fallback, unless allow_headless is
+    False (used by callers like deep_research that fan out across many URLs
+    under a shared time budget, where one slow headless attempt shouldn't
+    eat the whole budget)."""
     tier, _ = _domain_trust_tier(url)
     if not await _is_safe_url_async(url):
         return ExtractResult(url=url, content=None, strategy=None, trust_tier=tier)
@@ -536,6 +624,8 @@ async def extract_content(client: httpx.AsyncClient, url: str) -> ExtractResult:
     attempts.append(("googlebot-ua", lambda: _strategy_direct(client, url, ua_index=3, referer="https://www.google.com/")))
     attempts.append(("readability", lambda: _strategy_readability(client, url)))
     attempts.append(("wayback", lambda: _strategy_wayback(client, url)))
+    if allow_headless:
+        attempts.append(("headless-browser", lambda: _strategy_headless_browser(url)))
 
     for name, factory in attempts:
         try:
@@ -562,6 +652,7 @@ async def _get_http_client() -> httpx.AsyncClient:
                 _http_client = httpx.AsyncClient(
                     headers={"Accept-Encoding": "gzip, deflate"},
                     limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+                    http2=True,
                 )
     return _http_client
 
@@ -575,10 +666,12 @@ async def web_search(query: str, max_results: int = 5) -> str:
     Performs a quick web search and returns short result snippets (title, URL,
     summary) without visiting or scraping any pages. Use this for simple,
     fast lookups such as current prices, scores, quick facts, or definitions.
-    Automatically reformulates the query once if the first attempt returns
-    nothing, and ranks/deduplicates results for relevance. For in-depth
-    topics that need multi-source analysis and full-page content, use
-    'deep_research' instead.
+    Searches exactly the query you provide, unmodified - this tool does not
+    reformulate, expand, or otherwise alter your wording, so phrase `query`
+    the way you'd want it typed into a search engine. If you get no/poor
+    results, call again yourself with a different phrasing rather than
+    relying on this tool to guess one. For in-depth topics that need
+    multi-source analysis and full-page content, use 'deep_research' instead.
     """
     capped = max(1, min(max_results, 10))
 
@@ -596,17 +689,6 @@ async def web_search(query: str, max_results: int = 5) -> str:
     def _run_search() -> str:
         logger.info(f"Performing quick web search for: {query}")
         hits_per_query = [(query, _search_once(query))]
-
-        if not hits_per_query[0][1]:
-            # Zero results - a single literal phrasing is the #1 cause of
-            # empty results, so retry with up to 2 reformulations before
-            # giving up.
-            for variation in generate_query_variations(query, limit=2):
-                logger.info(f"No hits for original query; retrying with: {variation}")
-                hits = _search_once(variation)
-                hits_per_query.append((variation, hits))
-                if hits:
-                    break
 
         ranked = merge_and_rank_hits(hits_per_query)
         if not ranked:
@@ -626,12 +708,11 @@ async def web_search(query: str, max_results: int = 5) -> str:
 # TOOL CATEGORY 2: DEEP RESEARCH & THINKING AGENT
 # =====================================================================
 @mcp.tool()
-async def deep_research(topic: str) -> str:
+async def deep_research(topic: str, queries: list[str] | None = None) -> str:
     """
     Performs full deep research for topics that genuinely require it (e.g.
     in-depth explanations, comparisons, analysis, or open-ended questions).
-    Expands the topic into several query reformulations, searches the live
-    web for each, deduplicates and ranks the combined candidates by
+    Searches the live web, deduplicates and ranks the combined candidates by
     relevance/domain trust, then extracts full-page content from the best
     sources using an escalating multi-strategy fetcher (direct fetch,
     readability scoring, UA rotation, Wayback Machine, and paywall/Medium
@@ -639,39 +720,102 @@ async def deep_research(topic: str) -> str:
     'web_search' (it fetches full pages), so do NOT use it for simple
     quick-fact lookups (e.g. current prices, scores, dates) — use
     'web_search' for those instead.
+
+    `topic` is searched exactly as given - it is never reformulated,
+    expanded, or otherwise altered. If you want broader multi-angle
+    coverage (different phrasings, sub-questions, related angles, etc.),
+    pass them explicitly via `queries` (each run as its own search, same as
+    `topic`) rather than relying on this tool to invent them - you (the
+    model) own the decision of what to search for, since you understand the
+    user's actual intent far better than a keyword heuristic can. Only the
+    first 4 entries of `queries` are used.
     """
     TARGET_SOURCES = 4            # how many good sources we want in the final report
-    CANDIDATE_POOL_PER_QUERY = 6  # search hits to pull per query variation
+    CANDIDATE_POOL_PER_QUERY = 6  # search hits to pull per query
     MAX_EXTRACTION_ATTEMPTS = 10  # how many ranked candidates to try extracting
     EXTRACTION_CONCURRENCY = 4    # concurrent page fetches
-    EXTRACTION_TIMEOUT = 45       # overall cap so the tool call can't hang
+    MAX_ADDITIONAL_QUERIES = 4    # cap on caller-supplied extra queries, to protect SEARCH_BUDGET
+    SEARCH_BUDGET = 15            # overall cap for the whole search phase (all queries)
+    RANK_BUDGET = 10              # overall cap for dedup/trust ranking (DNS-resolving safety checks)
+    EXTRACTION_TIMEOUT = 30       # overall cap so the tool call can't hang
+    # With the budgets above, worst case is ~55s total - comfortably under
+    # the ~60-120s tool-call timeouts most MCP clients/relays enforce, so
+    # the tool reliably returns *something* instead of silently timing out.
 
-    def _search_all_variations() -> list[tuple[str, list[dict]]]:
-        # Query expansion: a single literal phrasing is the most common
-        # reason deep_research comes back empty or off-topic, so we fan out
-        # to a few genuinely different reformulations and merge the hits.
-        queries = [topic] + generate_query_variations(topic, limit=3)
-        hits_per_query = []
-        for q in queries:
-            try:
-                with DDGS(timeout=10) as ddgs:
-                    hits = ddgs.text(q, max_results=CANDIDATE_POOL_PER_QUERY, backend="auto") or []
-            except Exception as e:
-                logger.warning(f"deep_research query failed for '{q}': {e}")
-                hits = []
-            hits_per_query.append((q, hits))
-        return hits_per_query
+    start_time = asyncio.get_event_loop().time()
+
+    def _search_one(q: str) -> list[dict]:
+        try:
+            with DDGS(timeout=10) as ddgs:
+                return ddgs.text(q, max_results=CANDIDATE_POOL_PER_QUERY, backend="auto") or []
+        except Exception as e:
+            logger.warning(f"deep_research query failed for '{q}': {e}")
+            return []
 
     logger.info(f"Initiating deep multi-source research for: {topic}")
 
-    # Run the blocking ddgs calls in a worker thread so they can't stall the
-    # websocket bridge's event loop (and its ping/pong keepalive).
-    hits_per_query = await asyncio.to_thread(_search_all_variations)
+    # `topic` plus whatever additional queries the caller explicitly
+    # supplied (never auto-generated). Each runs concurrently in its own
+    # worker thread (instead of one after another) so N queries cost
+    # roughly one query's latency instead of N times it, and an overall
+    # SEARCH_BUDGET caps worst-case wall-clock time even if DDGS itself
+    # runs long. Deduplicated (preserving order) so a caller accidentally
+    # repeating `topic` inside `queries` doesn't spawn a wasted duplicate
+    # search task.
+    seen_queries: set[str] = set()
+    all_queries: list[str] = []
+    for q in [topic] + list(queries or [])[:MAX_ADDITIONAL_QUERIES]:
+        if q not in seen_queries:
+            seen_queries.add(q)
+            all_queries.append(q)
+    search_tasks = {q: asyncio.create_task(asyncio.to_thread(_search_one, q)) for q in all_queries}
+    done, pending = await asyncio.wait(search_tasks.values(), timeout=SEARCH_BUDGET)
+    if pending:
+        logger.warning(
+            f"deep_research search phase timed out for {len(pending)} of "
+            f"{len(all_queries)} quer{'y' if len(pending) == 1 else 'ies'} on '{topic}'"
+        )
+        for t in pending:
+            t.cancel()
+    hits_per_query = []
+    for q, task in search_tasks.items():
+        try:
+            hits_per_query.append((q, task.result() if task in done else []))
+        except Exception:
+            hits_per_query.append((q, []))
 
-    # Run off the event loop: merge_and_rank_hits calls the blocking (DNS-
-    # resolving) _is_safe_url for every hit, which would otherwise stall the
-    # websocket bridge's ping/pong keepalive during this coroutine.
-    ranked = await asyncio.to_thread(merge_and_rank_hits, hits_per_query)
+    # Dedup + rank by domain trust/authority. This calls the blocking
+    # (DNS-resolving) _is_safe_url for every hit, so it still runs off the
+    # event loop - but now under its own budget too, since a slow/hanging
+    # DNS lookup shouldn't be able to stall the whole tool call.
+    try:
+        ranked = await asyncio.wait_for(asyncio.to_thread(merge_and_rank_hits, hits_per_query), timeout=RANK_BUDGET)
+    except asyncio.TimeoutError:
+        logger.warning(f"deep_research ranking phase timed out for '{topic}'; using unranked, deduplicated hits")
+        # Cheap, DNS-free fallback: dedup by normalized URL only, skipping
+        # the trust/safety scoring. This only affects result ordering, not
+        # safety - extract_content() independently re-validates every URL
+        # (SSRF guard) before fetching anything from it.
+        seen: set[str] = set()
+        ranked = []
+        for _q, hits in hits_per_query:
+            for res in hits:
+                url = res.get("href") or res.get("url")
+                if not url:
+                    continue
+                key = _normalize_for_dedup(url)
+                if key in seen:
+                    continue
+                seen.add(key)
+                ranked.append({
+                    "url": _clean_result_url(url),
+                    "title": res.get("title") or "Unknown Source",
+                    "snippet": res.get("body") or res.get("snippet") or "",
+                    "hits": 1,
+                    "best_rank": 0,
+                    "trust_tier": "unknown",
+                    "trust_score": 0.4,
+                })
     if not ranked:
         return f"Deep research failed: No search results found for '{topic}'."
 
@@ -686,7 +830,11 @@ async def deep_research(topic: str) -> str:
 
     async def _extract_one(cand: dict) -> tuple[dict, ExtractResult]:
         async with semaphore:
-            result = await extract_content(client, cand["url"])
+            # allow_headless=False: deep_research fans out across many
+            # candidate URLs under a shared time budget, so the slowest
+            # fallback strategy (headless browser) is reserved for
+            # single-URL tools like special_info instead.
+            result = await extract_content(client, cand["url"], allow_headless=False)
             return cand, result
 
     def _fallback_result(cand: dict) -> tuple[dict, ExtractResult]:
@@ -747,44 +895,60 @@ async def deep_research(topic: str) -> str:
             f"sources for '{topic}' could be safely accessed or scraped."
         )
 
+    elapsed = asyncio.get_event_loop().time() - start_time
+    logger.info(f"deep_research completed for '{topic}' in {elapsed:.1f}s with {len(compiled_knowledge)} source(s)")
+
     report_header = f"=== DEEP RESEARCH REPORT GENERATED FOR: {topic.upper()} ===\n"
     return report_header + "\n".join(compiled_knowledge)
 
 # =====================================================================
-# TOOL CATEGORY 3: DAILY INFO DIGEST
+# TOOL CATEGORY 3: SPECIAL INFO SOURCE
 # =====================================================================
 @mcp.tool()
-async def daily_info() -> str:
+async def special_info() -> str:
     """
-    Fetches today's content from a fixed, daily-updated info page (facts,
-    news, discounts, or other interesting daily content depending on the
-    configured source) and returns the full page content. Uses the same
-    escalating multi-strategy fetcher as 'deep_research' (direct fetch,
-    readability scoring, UA rotation, Wayback Machine fallback), so a
-    temporary block or dead link is less likely to come back empty. Use
-    this when the user asks for 'today's info/update', 'what's new today',
-    or similar - this is NOT a general web search, it only reads one
-    specific configured source.
+    Fetches content from ONE specific, pre-configured info source (set up by
+    the operator ahead of time - e.g. a particular news/docs/discount page,
+    an internal resource, or any other fixed URL), and returns its full
+    current page content. Uses the same escalating multi-strategy fetcher as
+    'deep_research' (direct fetch, readability scoring, UA rotation, Wayback
+    Machine fallback), so a temporary block or dead link is less likely to
+    come back empty.
+
+    This is NOT a general web search and does NOT accept a topic/query - it
+    always reads the exact same configured source regardless of what the
+    user asks about. Only call this when the user's request specifically
+    matches what that configured source is for (the operator's system
+    prompt/instructions should describe what it is here); for any other
+    topic, question, or general lookup, use 'web_search' or 'deep_research'
+    instead.
     """
     MAX_CHARS = 300_000  # safety cap - stays well under websockets' ~1MB default message limit
 
-    if not DAILY_INFO_URL:
-        return "Error: DAILY_INFO_URL is not configured in Secrets yet."
-    if not _is_safe_url(DAILY_INFO_URL):
-        return "Error: DAILY_INFO_URL is not a safe/valid http(s) URL."
+    if not SPECIAL_INFO_URL:
+        return "Error: SPECIAL_INFO_URL is not configured in Secrets yet."
+    if not _is_safe_url(SPECIAL_INFO_URL):
+        return "Error: SPECIAL_INFO_URL is not a safe/valid http(s) URL."
 
     client = await _get_http_client()
     try:
-        result = await asyncio.wait_for(extract_content(client, DAILY_INFO_URL), timeout=30)
+        # 95s budget: the kill chain now ends with a headless-browser
+        # fallback (page navigation + settle delay) which takes longer than
+        # the plain HTTP strategies that precede it. Raised from 60s since
+        # the worst-case cumulative duration of all strategies combined
+        # (direct/googlebot/readability/wayback/headless, each slow-but-not
+        # -fast-failing) can exceed ~100s, which left the headless fallback
+        # without a fair chance to run before the outer timeout fired.
+        result = await asyncio.wait_for(extract_content(client, SPECIAL_INFO_URL), timeout=95)
     except asyncio.TimeoutError:
-        return "Error fetching daily info: request timed out."
+        return "Error fetching special info: request timed out."
     except Exception as e:
-        return f"Error fetching daily info: {str(e)}"
+        return f"Error fetching special info: {str(e)}"
 
     body_text = result.content
     if not body_text:
         return (
-            "Daily info fetch returned no readable content after trying "
+            "Special info fetch returned no readable content after trying "
             "multiple extraction strategies (direct fetch, UA rotation, "
             "readability scoring, Wayback Machine). The page may require "
             "JavaScript rendering, which this tool cannot execute."
@@ -792,7 +956,7 @@ async def daily_info() -> str:
 
     truncated = len(body_text) > MAX_CHARS
     body_text = body_text[:MAX_CHARS]
-    header = f"=== DAILY INFO ({datetime.now().strftime('%Y-%m-%d')}) ==="
+    header = f"=== SPECIAL INFO ({datetime.now().strftime('%Y-%m-%d')}) ==="
     if result.trust_tier == "suspicious":
         header += " [low-trust domain]"
     if truncated:
@@ -862,74 +1026,120 @@ def _extract_text(result) -> str:
         return "\n".join(parts)
     return str(items)
 
-async def run_mcp_bridge(endpoint_url: str):
-    logger.info("Connecting directly to remote MCP Bridge Endpoint...")
+
+# How often to send an application-level heartbeat over each connection. Some
+# intermediary proxies/load balancers (seen on certain free-tier hosts) only
+# treat actual data frames as "activity" and ignore low-level WebSocket
+# ping/pong control frames, recycling connections that look idle to them even
+# though this script's own ping/pong keepalive is working fine. Sending a
+# real (tiny) message periodically covers that case. This is a JSON-RPC
+# notification (no "id"), so per spec it never expects or receives a reply -
+# safe even if the remote side doesn't recognize the method.
+HEARTBEAT_INTERVAL = 25
+
+
+async def _heartbeat_loop(websocket, tag: str = ""):
+    try:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await websocket.send(json.dumps({"jsonrpc": "2.0", "method": "notifications/heartbeat"}))
+    except asyncio.CancelledError:
+        raise
+    except websockets.ConnectionClosed:
+        pass
+    except Exception as exc:
+        logger.debug(f"{tag}Heartbeat send failed: {exc}")
+
+
+async def run_mcp_bridge(endpoint_url: str, label: str | None = None):
+    tag = f"[{label}] " if label else ""
+    logger.info(f"{tag}Connecting directly to remote MCP Bridge Endpoint ({endpoint_url})...")
     while True:
         try:
-            async for websocket in websockets.connect(endpoint_url, ping_interval=20, ping_timeout=60*5):
+            async for websocket in websockets.connect(endpoint_url, ping_interval=20, ping_timeout=30):
+                heartbeat_task = asyncio.create_task(_heartbeat_loop(websocket, tag))
                 try:
-                    logger.info("Successfully connected to the remote cloud server!")
+                    logger.info(f"{tag}Successfully connected to the remote cloud server!")
                     async for message in websocket:
-                        request = json.loads(message)
-                        method = request.get("method")
-                        req_id = request.get("id")
-                        
-                        if method == "initialize":
-                            params = request.get("params", {})
-                            response = {"jsonrpc": "2.0","id": req_id,"result": {"protocolVersion": params.get("protocolVersion", "2024-11-05"),"capabilities": {"tools": {"listChanged": False}},"serverInfo": {"name": "AdvancedUnifiedToolbox","version": "1.0.0"}}}
-                            await websocket.send(json.dumps(response))
-                            logger.info("MCP initialize handshake completed.")
-                        elif method == "notifications/initialized":
-                            logger.info("MCP client initialization completed.")
-                        elif method == "tools/list":
-                            try:
-                                tools_list = await list_available_tools()
-                                response = {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools_list}}
-                            except Exception as e:
-                                logger.exception("Failed to list tools")
-                                response = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32603, "message": str(e)}}
-                            await websocket.send(json.dumps(response))
-                            logger.info("Synchronized structural multi-tool suite definitions.")
-                        elif method == "tools/call":
-                            params = request.get("params", {})
-                            tool_name = params.get("name")
-                            tool_args = params.get("arguments", {})
+                        # Each message is handled in its own try/except so a
+                        # single malformed/unexpected message (bad JSON, a
+                        # bug in a handler, etc.) can't take down the whole
+                        # connection and trigger an unnecessary reconnect -
+                        # only a genuine ConnectionClosed should do that.
+                        try:
+                            request = json.loads(message)
+                            method = request.get("method")
+                            req_id = request.get("id")
 
-                            logger.info(f"Execution requested for tool: {tool_name} with args: {tool_args}")
+                            if method == "initialize":
+                                params = request.get("params", {})
+                                response = {"jsonrpc": "2.0","id": req_id,"result": {"protocolVersion": params.get("protocolVersion", "2024-11-05"),"capabilities": {"tools": {"listChanged": False}},"serverInfo": {"name": "AdvancedUnifiedToolbox","version": "1.0.0"}}}
+                                await websocket.send(json.dumps(response))
+                                logger.info("MCP initialize handshake completed.")
+                            elif method == "notifications/initialized":
+                                logger.info("MCP client initialization completed.")
+                            elif method == "tools/list":
+                                try:
+                                    tools_list = await list_available_tools()
+                                    response = {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools_list}}
+                                except Exception as e:
+                                    logger.exception("Failed to list tools")
+                                    response = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32603, "message": str(e)}}
+                                await websocket.send(json.dumps(response))
+                                logger.info("Synchronized structural multi-tool suite definitions.")
+                            elif method == "tools/call":
+                                params = request.get("params", {})
+                                tool_name = params.get("name")
+                                tool_args = params.get("arguments", {})
 
-                            try:
-                                result = await execute_tool(tool_name, tool_args)
-                                response = {
-                                    "jsonrpc": "2.0",
-                                    "id": req_id,
-                                    "result": {
-                                        "content": [{"type": "text", "text": _extract_text(result)}]
+                                logger.info(f"Execution requested for tool: {tool_name} with args: {tool_args}")
+
+                                try:
+                                    result = await execute_tool(tool_name, tool_args)
+                                    response = {
+                                        "jsonrpc": "2.0",
+                                        "id": req_id,
+                                        "result": {
+                                            "content": [{"type": "text", "text": _extract_text(result)}]
+                                        }
                                     }
-                                }
-                            except LookupError as e:
-                                response = {
-                                    "jsonrpc": "2.0",
-                                    "id": req_id,
-                                    "error": {"code": -32601, "message": str(e)}
-                                }
-                            except Exception as e:
-                                logger.exception(f"Tool execution failed for '{tool_name}'")
-                                response = {
-                                    "jsonrpc": "2.0",
-                                    "id": req_id,
-                                    "error": {"code": -32603, "message": str(e)}
-                                }
+                                except LookupError as e:
+                                    response = {
+                                        "jsonrpc": "2.0",
+                                        "id": req_id,
+                                        "error": {"code": -32601, "message": str(e)}
+                                    }
+                                except Exception as e:
+                                    logger.exception(f"Tool execution failed for '{tool_name}'")
+                                    response = {
+                                        "jsonrpc": "2.0",
+                                        "id": req_id,
+                                        "error": {"code": -32603, "message": str(e)}
+                                    }
 
-                            await websocket.send(json.dumps(response))
-                            logger.info(f"Returned execution results for '{tool_name}'.")
+                                await websocket.send(json.dumps(response))
+                                logger.info(f"Returned execution results for '{tool_name}'.")
+                        except websockets.ConnectionClosed:
+                            raise
+                        except Exception as e:
+                            logger.warning(f"{tag}Failed to process an incoming message, skipping it: {e}")
 
-                except websockets.ConnectionClosed:
-                    logger.warning("Connection lost inside session. Attempting to reconnect...")
+                except websockets.ConnectionClosed as e:
+                    code = getattr(e, "code", None)
+                    reason = getattr(e, "reason", None) or "(no reason given)"
+                    origin = "server" if getattr(e, "rcvd", None) else "client/network"
+                    logger.warning(
+                        f"{tag}Connection lost inside session "
+                        f"(close_code={code}, reason={reason!r}, closed_by={origin}). "
+                        f"Attempting to reconnect..."
+                    )
                 except Exception as e:
-                    logger.error(f"Internal processing loop error occurred: {e}")
+                    logger.error(f"{tag}Internal processing loop error occurred: {e}")
+                finally:
+                    heartbeat_task.cancel()
 
         except Exception as e:
-            logger.error(f"Failed to connect or connection lost completely: {e}. Retrying in 5 seconds...")
+            logger.error(f"{tag}Failed to connect or connection lost completely: {e}. Retrying in 5 seconds...")
             await asyncio.sleep(5)
 
 def run_health_check_server():
@@ -952,14 +1162,37 @@ def run_health_check_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    if not MCP_BRIDGE_ENDPOINT:
+    if not MCP_BRIDGE_ENDPOINTS:
         logger.error("Error: MCP_BRIDGE_ENDPOINT variable not found in Secrets configuration!")
         sys.exit(1)
+
+    logger.info(f"Configured {len(MCP_BRIDGE_ENDPOINTS)} MCP Bridge Endpoint(s).")
 
     # Start the HTTP server in a separate background thread so it doesn't block the WebSocket bridge
     threading.Thread(target=run_health_check_server, daemon=True).start()
 
+    async def _run_all_bridges():
+        # Each endpoint gets its own independent, self-reconnecting websocket
+        # connection running concurrently, so one endpoint dropping doesn't
+        # affect the others. run_mcp_bridge() already retries forever
+        # internally and shouldn't normally raise, but return_exceptions=True
+        # ensures that even if something truly unexpected escapes one
+        # endpoint's task, asyncio.gather() won't cancel the other sibling
+        # connections to enforce that isolation guarantee end-to-end.
+        labels = (
+            [None] if len(MCP_BRIDGE_ENDPOINTS) == 1
+            else [f"conn-{i + 1}" for i in range(len(MCP_BRIDGE_ENDPOINTS))]
+        )
+        results = await asyncio.gather(
+            *(run_mcp_bridge(ep, label) for ep, label in zip(MCP_BRIDGE_ENDPOINTS, labels)),
+            return_exceptions=True,
+        )
+        for (ep, label), result in zip(zip(MCP_BRIDGE_ENDPOINTS, labels), results):
+            if isinstance(result, Exception):
+                tag = f"[{label}] " if label else ""
+                logger.error(f"{tag}Bridge task for {ep} exited unexpectedly: {result}")
+
     try:
-        asyncio.run(run_mcp_bridge(MCP_BRIDGE_ENDPOINT))
+        asyncio.run(_run_all_bridges())
     except KeyboardInterrupt:
         logger.info("Shutting down All-in-One Multi-Tool MCP Server.")
