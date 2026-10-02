@@ -2,4 +2,6 @@ mcp>=1.2.0,<2
 websockets>=12.0,<15
 ddgs>=9.14.4,<10
 httpx>=0.27,<1
+h2>=4,<5
 beautifulsoup4>=4.12,<5
+playwright>=1.47,<2
